@@ -15,6 +15,7 @@ import org.elasticsearch.common.transport.InetSocketTransportAddress;
 import org.elasticsearch.common.transport.TransportAddress;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import com.alibaba.fastjson.JSON;
@@ -43,7 +44,7 @@ import lombok.NoArgsConstructor;
  * @Author: D10865
  * @Description:
  * @Date: Create on 2018/9/14 下午1:22
- * @Modified By
+ * @Modified By 2023-08-17 11:14 slhu
  *
  * 更新es数据的客户端，数据只会写入arius-meta集群
  */
@@ -52,7 +53,6 @@ import lombok.NoArgsConstructor;
 public class ESUpdateClient {
 
     private static final ILog             LOGGER            = LogFactory.getLog(ESUpdateClient.class);
-    public static final int               MAX_RETRY_CONT    = 5;
 
     /**
      * 集群名称
@@ -66,20 +66,20 @@ public class ESUpdateClient {
     /**
      * 客户端个数
      */
-    private int                           clientCount       = 3;
+    private final int                           clientCount       = 3;
     /**
      *  更新es数据的客户端连接队列
      */
-    private final List<ESClient> updateClientPool  = Lists.newCopyOnWriteArrayList();
+    private List<ESClient> updateClientPool  = Lists.newCopyOnWriteArrayList();
 
     /**
      * 轮询获取esClient 时使用的下标
      */
     private final AtomicInteger  esClientCounter   = new AtomicInteger(0);
     /**
-     * 之前的http连接地址
+     * 之前的Cluster对象连接地址
      */
-    private String                        beforeHttpAddress = null;
+    private ClusterPhyPO beforeCluster = null;
 
     @Autowired
     private PhyClusterDAO                 clusterDAO;
@@ -90,11 +90,14 @@ public class ESUpdateClient {
     private static final String           ES_VERSION_PREFIX = "es-version";
 
     @PostConstruct
-    public void init() {
-        LOGGER.info("class=ESUpdateClient||method=init||ESUpdateClient init start.");
-        List<ClusterPhyPO> clusterPOS = clusterDAO.listAll();
-        setDataSourceList(clusterPOS);
-        LOGGER.info("class=ESUpdateClient||method=init||ESUpdateClient init finished.");
+    @Scheduled(cron = "0 3/5 * * * ?")
+    public void refreshConnect() {
+        LOGGER.info("class=ESUpdateClient||method=init||ESUpdateClient refreshConnect start.");
+        ClusterPhyPO query = new ClusterPhyPO();
+        query.setCluster(metadataClusterName);
+        List<ClusterPhyPO> clusterList = clusterDAO.listByCondition(query);
+        refreshUpdateClientPool(clusterList);
+        LOGGER.info("class=ESUpdateClient||method=init||ESUpdateClient refreshConnect finished.");
     }
 
     // delete by query
@@ -365,7 +368,7 @@ public class ESUpdateClient {
     private ESClient getUpdateEsClientFromPool() {
         ESClient esClient = null;
         try {
-            //这里获取当前轮询的次数，如果次数超过一定阈值则置为 0 （暂定阈值为client数量的10倍）
+            //这里获取当前轮询的次数，如果次数超过一定阈值则置为 0 （暂定阈值为client数量的5倍）
             int flag = esClientCounter.getAndIncrement();
             if (flag > clientCount * 5) {
                 esClientCounter.lazySet(0);
@@ -434,70 +437,57 @@ public class ESUpdateClient {
      * 初始化访问es集群的客户端
      *
      */
-    private void setDataSourceList(List<ClusterPhyPO> dataSourceList) {
-        if (dataSourceList == null) {
-            LOGGER.error("class=ESUpdateClient||method=setDataSourceList||errMsg=fail to get es clusters");
+    private void refreshUpdateClientPool(List<ClusterPhyPO> dataSourceList) {
+        if (CollectionUtils.isEmpty(dataSourceList)) {
+            LOGGER.error("class=ESUpdateClient||method=refreshUpdateClientPool||errMsg=fail to get es clusters");
             return;
         }
 
         ClusterPhyPO updateClusterDataSource = getUpdateClusterDataSource(dataSourceList);
 
         if (updateClusterDataSource == null) {
-            LOGGER.error("class=UpdateClient||method=setDataSourceList||errMsg=fail to get es cluster info {}",
-                metadataClusterName);
+            LOGGER.error("class=UpdateClient||method=refreshUpdateClientPool||errMsg=fail to get es cluster info {}",
+                    metadataClusterName);
             return;
         }
 
-        // 判断地址是否发生变化
-        if (beforeHttpAddress != null && updateClusterDataSource.getHttpAddress().equals(beforeHttpAddress)) {
+        if (null != beforeCluster && StringUtils.equals(updateClusterDataSource.getPassword(), beforeCluster.getPassword())
+                && StringUtils.equals(updateClusterDataSource.getHttpAddress(), beforeCluster.getHttpAddress())) {
             return;
         }
 
-        // 移除以存在的客户端
-        try {
-            ESClient beforeEsClient = null;
+        String httpAddress = updateClusterDataSource.getHttpAddress();
+        String pw = updateClusterDataSource.getPassword();
+        List<ESClient> innerList = Lists.newCopyOnWriteArrayList();
+        // 添加新的客户端
+        ESClient esClient;
+        for (int i = 0; i < clientCount; ++i) {
+            esClient = buildEsClient(httpAddress, pw, metadataClusterName);
+            if (esClient != null) {
+                innerList.add(esClient);
+                LOGGER.info("class=UpdateClient||method=refreshUpdateClientPool||msg=add new es client {}, {}",
+                        metadataClusterName, httpAddress);
+            }
+        }
+        if (CollectionUtils.isNotEmpty(innerList)) {
+            // 移除以存在的客户端
             Iterator<ESClient> iterator = this.updateClientPool.iterator();
-            if (iterator != null) {
-                while (iterator.hasNext()) {
-                    beforeEsClient = iterator.next();
-                    if (beforeEsClient != null) {
-                        beforeEsClient.close();
-                    }
-                    iterator.remove();
-                    LOGGER.info("class=UpdateClient||method=setDataSourceList||msg=remove old es client {}, {}",
-                        metadataClusterName, beforeHttpAddress);
+            this.updateClientPool = innerList;
+            while (iterator.hasNext()) {
+                try {
+                    iterator.next().close();
+                } catch (Exception e) {
+                    LOGGER.error("class=UpdateClient||method=refreshUpdateClientPool||errMsg=fail to close old es client {}",
+                            metadataClusterName, e);
                 }
             }
-        } catch (Exception e) {
-            LOGGER.error("class=UpdateClient||method=setDataSourceList||errMsg=fail to remove old es client {}",
-                metadataClusterName, e);
         }
 
-        this.updateClientPool.clear();
-        beforeHttpAddress = updateClusterDataSource.getHttpAddress();
-        String pw = updateClusterDataSource.getPassword();
-
-        // 添加新的客户端
-        ESClient esClient = null;
-        for (int i = 0; i < clientCount; ++i) {
-            esClient = buildEsClient(beforeHttpAddress, pw, metadataClusterName);
-            if (esClient != null) {
-                this.updateClientPool.add(esClient);
-                LOGGER.info("class=UpdateClient||method=setDataSourceList||msg=add new es client {}, {}",
-                    metadataClusterName, beforeHttpAddress);
-            }
-        }
+        beforeCluster = updateClusterDataSource;
     }
 
     private ClusterPhyPO getUpdateClusterDataSource(List<ClusterPhyPO> dataSourceList) {
-        ClusterPhyPO updateClusterDataSource = null;
-        for (ClusterPhyPO dataSource : dataSourceList) {
-            if (metadataClusterName.equals(dataSource.getCluster())) {
-                updateClusterDataSource = dataSource;
-                break;
-            }
-        }
-        return updateClusterDataSource;
+        return dataSourceList.stream().filter(cluster -> metadataClusterName.equals(cluster.getCluster())).findAny().orElse(null);
     }
 
     private boolean handleErrorResponse(String indexName, String typeName, List<? extends BaseESPO> pos,
